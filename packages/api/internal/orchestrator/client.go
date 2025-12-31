@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/google/uuid"
@@ -81,21 +82,46 @@ func (o *Orchestrator) listNomadNodes(ctx context.Context) ([]nodemanager.NomadS
 	_, listSpan := tracer.Start(ctx, "list-nomad-nodes")
 	defer listSpan.End()
 
-	options := &nomadapi.QueryOptions{
-		// TODO: Use variable for node pool name ("default")
-		Filter: "Status == \"ready\" and NodePool == \"default\"",
+	jobID := os.Getenv("ORCHESTRATOR_JOB_ID")
+	if jobID == "" {
+		jobID = "orchestrator"
 	}
-	nomadNodes, _, err := o.nomadClient.Nodes().List(options.WithContext(ctx))
+
+	options := &nomadapi.QueryOptions{
+		// We only care about running allocations (process is started).
+		// The actual application-level health check (GRPC) is performed later in connectToNode -> nodemanager.New
+		Filter: fmt.Sprintf("ClientStatus == \"running\" and JobID contains \"%s\"", jobID),
+		// https://developer.hashicorp.com/nomad/api-docs/allocations#resources
+		// Return allocation resources as part of the response
+		Params: map[string]string{"resources": "true"},
+	}
+	allocations, _, err := o.nomadClient.Allocations().List(options.WithContext(ctx))
 	if err != nil {
 		return nil, err
 	}
 
-	result := make([]nodemanager.NomadServiceDiscovery, 0, len(nomadNodes))
-	for _, n := range nomadNodes {
+	result := make([]nodemanager.NomadServiceDiscovery, 0, len(allocations))
+	for _, alloc := range allocations {
+		if alloc.AllocatedResources == nil {
+			continue
+		}
+
+		networks := alloc.AllocatedResources.Shared.Networks
+		if len(networks) == 0 {
+			continue
+		}
+
+		ip := networks[0].IP
+
+		nodeID := alloc.NodeID
+		if len(nodeID) > consts.NodeIDLength {
+			nodeID = nodeID[:consts.NodeIDLength]
+		}
+
 		result = append(result, nodemanager.NomadServiceDiscovery{
-			NomadNodeShortID:    n.ID[:consts.NodeIDLength],
-			OrchestratorAddress: fmt.Sprintf("%s:%s", n.Address, consts.OrchestratorPort),
-			IPAddress:           n.Address,
+			NomadNodeShortID:    nodeID,
+			OrchestratorAddress: fmt.Sprintf("%s:%s", ip, consts.OrchestratorPort),
+			IPAddress:           ip,
 		})
 	}
 
